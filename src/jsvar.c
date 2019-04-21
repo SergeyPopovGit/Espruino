@@ -3024,6 +3024,12 @@ JsVar *jsvGetArrayItem(const JsVar *arr, JsVarInt index) {
   return jsvSkipNameAndUnLock(jsvGetArrayIndex(arr,index));
 }
 
+JsVar *jsvGetLastArrayItem(const JsVar *arr) {
+  JsVarRef childref = jsvGetLastChild(arr);
+  if (!childref) return 0;
+  return jsvSkipNameAndUnLock(jsvLock(childref));
+}
+
 void jsvSetArrayItem(JsVar *arr, JsVarInt index, JsVar *item) {
   JsVar *indexVar = jsvGetArrayIndex(arr, index);
   if (indexVar) {
@@ -3997,6 +4003,7 @@ JsVar *jsvNewArrayBufferWithPtr(unsigned int length, char **ptr) {
 
 JsVar *jsvNewArrayBufferWithData(JsVarInt length, unsigned char *data) {
   assert(data);
+  assert(length>0);
   JsVar *dst = 0;
   JsVar *arr = jsvNewArrayBufferWithPtr((unsigned int)length, (char**)&dst);
   if (!dst) {
@@ -4008,6 +4015,7 @@ JsVar *jsvNewArrayBufferWithData(JsVarInt length, unsigned char *data) {
 }
 
 void *jsvMalloc(size_t size) {
+  assert(size>0);
   /** Allocate flat string, return pointer to its first element.
    * As we drop the pointer here, it's left locked. jsvGetFlatStringPointer
    * is also safe if 0 is passed in.  */

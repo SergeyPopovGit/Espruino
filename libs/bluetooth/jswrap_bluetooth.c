@@ -179,7 +179,7 @@ void jswrap_ble_reconfigure_softdevice() {
   // restart various
   JsVar *v,*o;
   v = jsvObjectGetChild(execInfo.root, BLE_SCAN_EVENT,0);
-  if (v) jsble_set_scanning(true);
+  if (v) jsble_set_scanning(true, false);
   jsvUnLock(v);
   v = jsvObjectGetChild(execInfo.root, BLE_RSSI_EVENT,0);
   if (v) jsble_set_rssi_scan(true);
@@ -223,7 +223,7 @@ void jswrap_ble_kill() {
   if (bleTaskInfo) jsvUnLock(bleTaskInfo);
   bleTaskInfo = 0;
   // if we were scanning, make sure we stop
-  jsble_set_scanning(false);
+  jsble_set_scanning(false, false);
   jsble_set_rssi_scan(false);
 
 #if CENTRAL_LINK_COUNT>0
@@ -468,7 +468,7 @@ Use `NRF.sleep()` to disable advertising.
 */
 void jswrap_ble_wake() {
   bleStatus &= ~BLE_IS_SLEEPING;
-  jsble_advertising_start();
+  jsble_check_error(jsble_advertising_start());
 }
 
 /*JSON{
@@ -641,15 +641,15 @@ you want to advertise more data, consider using an array for `data` (See below),
 `NRF.setScanResponse`.
 
 You can even specify an array of arrays or objects, in which case each advertising packet
-will be used in turn - for instance to make your device advertise
-both Eddystone and iBeacon:
+will be used in turn - for instance to make your device advertise battery level and its name
+as well as both Eddystone and iBeacon :
 
 ```
 NRF.setAdvertising([
   {0x180F : [Puck.getBatteryPercentage()]}, // normal advertising, with battery %
   require("ble_ibeacon").get(...), // iBeacon
   require("ble_eddystone").get(...), // eddystone
-],{interval:500});
+], {interval:300});
 ```
 
 `options` is an object, which can contain:
@@ -660,11 +660,18 @@ NRF.setAdvertising([
   showName: true/false // include full name, or nothing
   discoverable: true/false // general discoverable, or limited - default is limited
   connectable: true/false // whether device is connectable - default is true
+  scannable : true/false // whether device can be scanned for scan response packets - default is true
   interval: 600 // Advertising interval in msec, between 20 and 10000 (default is 375ms)
   manufacturer: 0x0590 // IF sending manufacturer data, this is the manufacturer ID
   manufacturerData: [...] // IF sending manufacturer data, this is an array of data
 }
 ```
+
+Setting `connectable` and `scannable` to false gives the lowest power consumption
+as the BLE radio doesn't have to listen after sending advertising.
+
+**NOTE:** Non-`connectable` advertising can't have an advertising interval less than 100ms
+according to the BLE spec.
 
 So for instance to set the name of Puck.js without advertising any
 other data you can just use the command:
@@ -724,6 +731,12 @@ void jswrap_ble_setAdvertising(JsVar *data, JsVar *options) {
     if (v) {
       if (jsvGetBoolAndUnLock(v)) bleStatus &= ~BLE_IS_NOT_CONNECTABLE;
       else bleStatus |= BLE_IS_NOT_CONNECTABLE;
+      bleChanged = true;
+    }
+    v = jsvObjectGetChild(options, "scannable", 0);
+    if (v) {
+      if (jsvGetBoolAndUnLock(v)) bleStatus &= ~BLE_IS_NOT_SCANNABLE;
+      else bleStatus |= BLE_IS_NOT_SCANNABLE;
       bleChanged = true;
     }
 
@@ -843,7 +856,7 @@ void jswrap_ble_setAdvertising(JsVar *data, JsVar *options) {
   jsvUnLock(initialArray);
   jsble_check_error(err_code);
   if (bleChanged && isAdvertising)
-    jsble_advertising_start();
+    jsble_check_error(jsble_advertising_start());
 }
 
 /*JSON{
@@ -992,7 +1005,11 @@ void jswrap_ble_setScanResponse(JsVar *data) {
       return;
     }
 #ifdef NRF5X
-//FIXME    err_code = sd_ble_gap_adv_data_set(NULL, 0, (uint8_t *)dPtr, dLen);
+#if NRF_SD_BLE_API_VERSION<5
+    err_code = sd_ble_gap_adv_data_set(NULL, 0, (uint8_t *)dPtr, dLen);
+#else
+    jsWarn("setScanResponse not working on SDK15\n");
+#endif
 #else
     err_code = 0xDEAD;
     jsiConsolePrintf("FIXME\n");
@@ -1115,6 +1132,12 @@ UART, however you then be unable to connect to Puck.js's console via Bluetooth.
 If you absolutely require two or more 128 bit UUIDs then you will have to
 specify your own raw advertising data packets with `NRF.setAdvertising`
 
+**Note:** The services on Espruino can only be modified when there is
+no device connected to it as it requires a restart of the Bluetooth stack.
+**iOS devices will 'cache' the list of services** so apps like
+NRF Connect may incorrectly display the old services even after you 
+have modified them. To fix this, disable and re-enable Bluetooth on your
+iOS device, or use an Android device to run NRF Connect.
 */
 void jswrap_ble_setServices(JsVar *data, JsVar *options) {
   if (!(jsvIsObject(data) || jsvIsUndefined(data))) {
@@ -1261,6 +1284,14 @@ void jswrap_ble_updateServices(JsVar *data) {
   uint32_t err_code;
   bool ok = true;
 
+  if (bleStatus & BLE_NEEDS_SOFTDEVICE_RESTART) {
+    jsExceptionHere(JSET_ERROR, "Can't update services until BLE restart");
+    /* TODO: We could conceivably update hiddenRoot->BLE_NAME_SERVICE_DATA so that
+    when the softdevice restarts it contains the updated data, but this seems like
+    overkill and potentially could cause nasty hidden bugs. */
+    return;
+  }
+
 #ifdef NRF5X
   jsble_peripheral_activity(); // flag that we've been busy
 #endif
@@ -1359,8 +1390,7 @@ void jswrap_ble_updateServices(JsVar *data) {
     jsvObjectIteratorFree(&it);
 
   } else if (!jsvIsUndefined(data)) {
-    jsExceptionHere(JSET_TYPEERROR, "Expecting object or undefined, got %t",
-        data);
+    jsExceptionHere(JSET_TYPEERROR, "Expecting object or undefined, got %t", data);
   }
 }
 
@@ -1527,6 +1557,10 @@ NRF.setScan(function(d) {
 }, { filters: [{ manufacturerData:{0x0590:{}} }] });
 ```
 
+You can also specify `active:true` in the second argument to perform
+active scanning (this requests scan response packets) from any
+devices it finds.
+
 **Note:** BLE advertising packets can arrive quickly - faster than you'll
 be able to print them to the console. It's best only to print a few, or
 to use a function like `NRF.findDevices(..)` which will collate a list
@@ -1605,7 +1639,9 @@ void jswrap_ble_setScan_cb(JsVar *callback, JsVar *filters, JsVar *adv) {
 
 void jswrap_ble_setScan(JsVar *callback, JsVar *options) {
   JsVar *filters = 0;
+  bool activeScan = false;
   if (jsvIsObject(options)) {
+    activeScan = jsvGetBoolAndUnLock(jsvObjectGetChild(options, "active", 0));
     filters = jsvObjectGetChild(options, "filters", 0);
     if (filters && !jsvIsArray(filters)) {
       jsvUnLock(filters);
@@ -1628,7 +1664,7 @@ void jswrap_ble_setScan(JsVar *callback, JsVar *options) {
     jsvObjectRemoveChild(execInfo.root, BLE_SCAN_EVENT);
   }
   // either start or stop scanning
-  uint32_t err_code = jsble_set_scanning(callback != 0);
+  uint32_t err_code = jsble_set_scanning(callback != 0, activeScan);
   jsble_check_error(err_code);
   jsvUnLock(filters);
 }
@@ -1641,7 +1677,7 @@ void jswrap_ble_setScan(JsVar *callback, JsVar *options) {
     "generate" : "jswrap_ble_findDevices",
     "params" : [
       ["callback","JsVar","The callback to call with received advertising packets, or undefined to stop"],
-      ["options","JsVar","A time in milliseconds to scan for (defaults to 2000), Or an optional object `{filters: ..., timeout : ...}` (as would be passed to `NRF.requestDevice`) to filter devices by"]
+      ["options","JsVar","A time in milliseconds to scan for (defaults to 2000), Or an optional object `{filters: ..., timeout : ..., active: bool}` (as would be passed to `NRF.requestDevice`) to filter devices by"]
     ]
 }
 Utility function to return a list of BLE devices detected in range. Behind the scenes,
@@ -2204,6 +2240,16 @@ void jswrap_ble_sendHIDReport(JsVar *data, JsVar *callback) {
 Search for available devices matching the given filters. Since we have no UI here,
 Espruino will pick the FIRST device it finds, or it'll call `catch`.
 
+`options` can have the following fields:
+
+* `filters` - a list of filters that a device must match before it is returned (see below)
+* `timeout` - the maximum time to scan for in milliseconds (scanning stops when a match
+is found. eg. `NRF.requestDevice({ timeout:2000, filters: [ ... ] })`
+* `active` - whether to perform active scanning (requesting 'scan response' packets from any
+devices that are found). eg. `NRF.requestDevice({ active:true, filters: [ ... ] })`
+
+**NOTE:** `timeout` and `active` are not part of the Web Bluetooth standard.
+
 The following filter types are implemented:
 
 * `services` - list of services as strings (all of which must match). 128 bit services must be in the form '01230123-0123-0123-0123-012301230123'
@@ -2219,12 +2265,6 @@ NRF.requestDevice({ filters: [{ namePrefix: 'Puck.js' }] }).then(function(device
 NRF.requestDevice({ filters: [{ services: ['1823'] }] }).then(function(device) { ... });
 // or
 NRF.requestDevice({ filters: [{ manufacturerData:{0x0590:{}} }] }).then(function(device) { ... });
-```
-
-You can also specify a timeout to wait for devices in milliseconds. The default is 2 seconds (2000):
-
-```
-NRF.requestDevice({ timeout:2000, filters: [ ... ] })
 ```
 
 As a full example, to send data to another Puck.js to turn an LED on:
@@ -2258,7 +2298,7 @@ NRF.requestDevice({ filters: [{ namePrefix: 'Puck.js' }]}).then(
   () => { gatt.disconnect(); console.log("Done!"); } );
 ```
 
-Note that you'll have to keep track of the `gatt` variable so that you can
+Note that you have to keep track of the `gatt` variable so that you can
 disconnect the Bluetooth connection when you're done.
 */
 #if CENTRAL_LINK_COUNT>0
@@ -2618,11 +2658,11 @@ To be used as a response when the event `BluetoothDevice.sendPasskey` has been r
 specifically for Espruino.
 */
 #if NRF52
-void jswrap_ble_BluetoothDevice_sendPasskey(JsVar *passkeyVar) {
+void jswrap_ble_BluetoothDevice_sendPasskey(JsVar *parent, JsVar *passkeyVar) {
   char passkey[BLE_GAP_PASSKEY_LEN+1];
   memset(passkey, 0, sizeof(passkey));
   jsvGetString(passkeyVar, passkey, sizeof(passkey));
-  uint32_t err_code = jsble_central_send_passkey( passkey);
+  uint32_t err_code = jsble_central_send_passkey(passkey);
   jsble_check_error(err_code);
 }
 #endif
@@ -3158,7 +3198,7 @@ NRF.connect(device_address).then(function(d) {
   });
   return c.startNotifications();
 }).then(function(d) {
-  console.log("Waiting for notifications"));
+  console.log("Waiting for notifications");
 }).catch(function() {
   console.log("Something's broken.");
 });

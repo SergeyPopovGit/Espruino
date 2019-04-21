@@ -151,7 +151,6 @@ typedef enum {
 0)
 /// Should a pin of this state have an internal pullup?
 #define JSHPINSTATE_IS_PULLUP(state) ( \
-            (state)==JSHPINSTATE_GPIO_OUT_OPENDRAIN ||      \
             (state)==JSHPINSTATE_GPIO_OUT_OPENDRAIN_PULLUP || \
             (state)==JSHPINSTATE_GPIO_IN_PULLUP ||          \
             (state)==JSHPINSTATE_USART_IN ||                \
@@ -389,6 +388,13 @@ typedef enum {
 } JshGetPinAddressFlags;
 // Get the address to read/write to in order to change the state of this pin. Or 0.
 volatile uint32_t *jshGetPinAddress(Pin pin, JshGetPinAddressFlags flags);
+
+/// Set the prescaler used for the RTC - can be used for course RTC adjustment
+void jshSetupRTCPrescalerValue(unsigned int prescale);
+/// Get the current prescaler value, or the calculated correct value if calibrate=true
+int jshGetRTCPrescalerValue(bool calibrate);
+// Reset timers and average systick duration counters for RTC - when coming out of sleep or changing prescaler
+void jshResetRTCTimer();
 #endif
 
 #if defined(NRF51) || defined(NRF52)

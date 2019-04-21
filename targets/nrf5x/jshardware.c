@@ -62,8 +62,158 @@ void app_error_fault_handler(uint32_t id, uint32_t pc, uint32_t info) {
 #include "softdevice_handler.h"
 #endif
 
+void WDT_IRQHandler() {
+}
+
+#ifdef NRF_USB
+#include "app_usbd_core.h"
+#include "app_usbd.h"
+#include "app_usbd_string_desc.h"
+#include "app_usbd_cdc_acm.h"
+#include "app_usbd_serial_num.h"
+#include "nrf_drv_clock.h"
+#include "nrf_drv_power.h"
+
+/**
+ * @brief Enable power USB detection
+ *
+ * Configure if example supports USB port connection
+ */
+#ifndef USBD_POWER_DETECTION
+#define USBD_POWER_DETECTION false // power detection true doesn't seem to work
+#endif
+
+static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const * p_inst,
+                                    app_usbd_cdc_acm_user_event_t event);
+
+#define CDC_ACM_COMM_INTERFACE  0
+#define CDC_ACM_COMM_EPIN       NRF_DRV_USBD_EPIN2
+
+#define CDC_ACM_DATA_INTERFACE  1
+#define CDC_ACM_DATA_EPIN       NRF_DRV_USBD_EPIN1
+#define CDC_ACM_DATA_EPOUT      NRF_DRV_USBD_EPOUT1
+
+
+/**
+ * @brief CDC_ACM class instance
+ * */
+APP_USBD_CDC_ACM_GLOBAL_DEF(m_app_cdc_acm,
+                            cdc_acm_user_ev_handler,
+                            CDC_ACM_COMM_INTERFACE,
+                            CDC_ACM_DATA_INTERFACE,
+                            CDC_ACM_COMM_EPIN,
+                            CDC_ACM_DATA_EPIN,
+                            CDC_ACM_DATA_EPOUT,
+                            APP_USBD_CDC_COMM_PROTOCOL_AT_V250
+);
+
+static char m_rx_buffer[1]; // only seems to work with 1 at the moment
+static char m_tx_buffer[NRF_DRV_USBD_EPSIZE];
+
+/**
+ * @brief  USB connection status
+ * */
+static bool m_usb_connected = false;
+static bool m_usb_open = false;
+
+/**
+ * @brief User event handler @ref app_usbd_cdc_acm_user_ev_handler_t (headphones)
+ * */
+static void cdc_acm_user_ev_handler(app_usbd_class_inst_t const * p_inst,
+                                    app_usbd_cdc_acm_user_event_t event)
+{
+    app_usbd_cdc_acm_t const * p_cdc_acm = app_usbd_cdc_acm_class_get(p_inst);
+    jshHadEvent();
+
+    switch (event)
+    {
+        case APP_USBD_CDC_ACM_USER_EVT_PORT_OPEN:
+        {
+          jsiConsolePrintf("APP_USBD_CDC_ACM_USER_EVT_PORT_OPEN\n");
+            m_usb_open = true;
+            /*Setup first transfer*/
+            ret_code_t ret = app_usbd_cdc_acm_read(&m_app_cdc_acm,
+                                                   m_rx_buffer,
+                                                   sizeof(m_rx_buffer));
+            UNUSED_VARIABLE(ret);
+            break;
+        }
+        case APP_USBD_CDC_ACM_USER_EVT_PORT_CLOSE:
+          jsiConsolePrintf("APP_USBD_CDC_ACM_USER_EVT_PORT_CLOSE\n");
+            m_usb_open = false;
+            break;
+        case APP_USBD_CDC_ACM_USER_EVT_TX_DONE:
+            // TODO: queue extra transmit here
+            break;
+        case APP_USBD_CDC_ACM_USER_EVT_RX_DONE:
+        {
+            ret_code_t ret;
+            do
+            {
+	      /*Get amount of data transfered*/
+	      size_t size = app_usbd_cdc_acm_rx_size(p_cdc_acm);
+	      jshPushIOCharEvents(EV_USBSERIAL,  m_rx_buffer, size);
+
+
+	      /*Setup next transfer*/
+	      ret = app_usbd_cdc_acm_read(&m_app_cdc_acm,
+	                                           m_rx_buffer,
+	                                           sizeof(m_rx_buffer));
+            } while (ret == NRF_SUCCESS);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static void usbd_user_ev_handler(app_usbd_event_type_t event)
+{
+  jshHadEvent();
+    switch (event)
+    {
+        case APP_USBD_EVT_DRV_SUSPEND:
+          jsiConsolePrintf("APP_USBD_EVT_DRV_SUSPEND\n");
+            break;
+        case APP_USBD_EVT_DRV_RESUME:
+          jsiConsolePrintf("APP_USBD_EVT_DRV_RESUME\n");
+            break;
+        case APP_USBD_EVT_STARTED:
+          jsiConsolePrintf("APP_USBD_EVT_STARTED\n");
+            break;
+        case APP_USBD_EVT_STOPPED:
+          jsiConsolePrintf("APP_USBD_EVT_STOPPED\n");
+            app_usbd_disable();
+            break;
+        case APP_USBD_EVT_POWER_DETECTED:
+            jsiConsolePrintf("APP_USBD_EVT_POWER_DETECTED\n");
+
+            if (!nrf_drv_usbd_is_enabled())
+            {
+                app_usbd_enable();
+            }
+            break;
+        case APP_USBD_EVT_POWER_REMOVED:
+            jsiConsolePrintf("APP_USBD_EVT_POWER_REMOVED\n");
+            m_usb_connected = false;
+            app_usbd_stop();            
+            break;
+        case APP_USBD_EVT_POWER_READY:
+            jsiConsolePrintf("APP_USBD_EVT_POWER_READY\n");
+            app_usbd_start();
+            m_usb_connected = true;
+            break;
+        default:
+            break;
+    }
+}
+
+#endif
+
+
 #define SYSCLK_FREQ 1048576 // 1 << 20
 #define RTC_SHIFT 5 // to get 32768 up to SYSCLK_FREQ
+
 
 /*  S110_SoftDevice_Specification_2.0.pdf
 
@@ -135,6 +285,7 @@ void jsh_sys_evt_handler(uint32_t sys_evt) {
 
 /* SysTick interrupt Handler. */
 void SysTick_Handler(void)  {
+  // TODO: When using USB it seems this isn't called
   /* Handle the delayed Ctrl-C -> interrupt behaviour (see description by EXEC_CTRL_C's definition)  */
   if (execInfo.execute & EXEC_CTRL_C_WAIT)
     execInfo.execute = (execInfo.execute & ~EXEC_CTRL_C_WAIT) | EXEC_INTERRUPTED;
@@ -250,6 +401,8 @@ void jshResetPeripherals() {
 }
 
 void jshInit() {
+  ret_code_t err_code;
+
   memset(pinStates, 0, sizeof(pinStates));
 
   jshInitDevices();
@@ -278,6 +431,9 @@ void jshInit() {
     inf.pinTX = DEFAULT_CONSOLE_TX_PIN;
     inf.baudRate = DEFAULT_CONSOLE_BAUDRATE;
     jshUSARTSetup(EV_SERIAL1, &inf); // Initialize UART for communication with Espruino/terminal.
+  } else {
+    // If there's no UART, 'disconnect' the IO pin - this saves power when in deep sleep in noisy electrical environments
+    jshPinSetState(DEFAULT_CONSOLE_RX_PIN, JSHPINSTATE_UNDEFINED);
   }
 #endif
 
@@ -303,14 +459,36 @@ void jshInit() {
   nrf_timer_int_enable(NRF_TIMER1, NRF_TIMER_INT_COMPARE0_MASK );
 
   // Pin change
-  uint32_t err_code;
   nrf_drv_gpiote_init();
 #ifdef BLUETOOTH
 #if NRF_SD_BLE_API_VERSION<5
   APP_TIMER_INIT(APP_TIMER_PRESCALER, APP_TIMER_OP_QUEUE_SIZE, false);
 #else
-  app_timer_init();
+  err_code = app_timer_init();
+  APP_ERROR_CHECK(err_code);
 #endif
+#ifdef NRF_USB
+  uint32_t ret;
+
+  static const app_usbd_config_t usbd_config = {
+      .ev_state_proc = usbd_user_ev_handler
+  };
+
+  app_usbd_serial_num_generate();
+
+  ret = nrf_drv_clock_init();
+  APP_ERROR_CHECK(ret);
+
+  jsiConsolePrintf("USBD init\n");
+  ret = app_usbd_init(&usbd_config);
+  APP_ERROR_CHECK(ret);
+  jsiConsolePrintf("ok\n");
+  app_usbd_class_inst_t const * class_cdc_acm = app_usbd_cdc_acm_class_inst_get(&m_app_cdc_acm);
+  ret = app_usbd_class_append(class_cdc_acm);
+  APP_ERROR_CHECK(ret);
+  jsiConsolePrintf("cdc ok\n");
+#endif
+
   jsble_init();
 
   err_code = app_timer_create(&m_wakeup_timer_id,
@@ -336,6 +514,25 @@ void jshInit() {
   srand(jshGetRandomNumber());
 #endif
 
+#ifdef NRF_USB
+    if (USBD_POWER_DETECTION)
+    {
+      jsiConsolePrintf("app_usbd_power_events_enable\n");
+        ret = app_usbd_power_events_enable();
+        APP_ERROR_CHECK(ret);
+    }
+    else
+    {
+        jsiConsolePrintf("No USB power detection enabled\nStarting USB now\n");
+
+        app_usbd_enable();
+        app_usbd_start();
+    }
+
+  jsiConsolePrintf("USB init done\n");
+#endif
+
+
 #ifdef LED1_PININDEX
   jshPinOutput(LED1_PININDEX, !LED1_ONSTATE);
 #endif
@@ -353,6 +550,19 @@ void jshKill() {
 
 // stuff to do on idle
 void jshIdle() {
+#ifdef NRF_USB
+  while (app_usbd_event_queue_process()); /* Nothing to do */
+
+  int l = 0;
+  int c;
+  while ((l<sizeof(m_tx_buffer)) && ((c = jshGetCharToTransmit(EV_USBSERIAL))>=0))
+    m_tx_buffer[l++] = c;
+  if (l) {
+    // TODO: check return value?
+    // This is asynchronous call. User should wait for @ref APP_USBD_CDC_ACM_USER_EVT_TX_DONE event
+    uint32_t ret = app_usbd_cdc_acm_write(&m_app_cdc_acm, m_tx_buffer, l);
+  }
+#endif
 }
 
 /// Get this IC's serial number. Passed max # of chars and a pointer to write to. Returns # of chars
@@ -363,7 +573,11 @@ int jshGetSerialNumber(unsigned char *data, int maxChars) {
 
 // is the serial device connected?
 bool jshIsUSBSERIALConnected() {
-  return true;
+#ifdef NRF_USB
+  return m_usb_open;
+#else
+  return false;
+#endif
 }
 
 /// Hack because we *really* don't want to mess with RTC0 :)
@@ -712,6 +926,8 @@ JshPinFunction jshGetFreeTimer(JsVarFloat freq) {
 }
 
 JshPinFunction jshPinAnalogOutput(Pin pin, JsVarFloat value, JsVarFloat freq, JshAnalogOutputFlags flags) {
+  if (value>1) value=1;
+  if (value<0) value=0;
 #ifdef NRF52
   // Try and use existing pin function
   JshPinFunction func = pinStates[pin];
@@ -1348,12 +1564,15 @@ bool jshSleep(JsSysTime timeUntilWake) {
     jstSetWakeUp(timeUntilWake);
 #endif
   }
-  hadEvent = false;
   jsiSetSleep(JSI_SLEEP_ASLEEP);
   while (!hadEvent) {
     sd_app_evt_wait(); // Go to sleep, wait to be woken up
     jshGetSystemTime(); // check for RTC overflows
+    #ifdef NRF_USB
+    while (app_usbd_event_queue_process()); /* Nothing to do */
+    #endif
   }
+  hadEvent = false;
   jsiSetSleep(JSI_SLEEP_AWAKE);
 #ifdef BLUETOOTH
   // we don't care about the return codes...
@@ -1394,6 +1613,7 @@ void jshUtilTimerStart(JsSysTime period) {
 void jshUtilTimerDisable() {
   utilTimerActive = false;
   nrf_timer_task_trigger(NRF_TIMER1, NRF_TIMER_TASK_STOP);
+  nrf_timer_task_trigger(NRF_TIMER1, NRF_TIMER_TASK_SHUTDOWN);
 }
 
 // the temperature from the internal temperature sensor
